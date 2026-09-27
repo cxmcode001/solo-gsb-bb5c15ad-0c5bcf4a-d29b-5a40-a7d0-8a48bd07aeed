@@ -7,6 +7,8 @@ import type {
   DocSnapshot,
   ExportBundle,
   IssueBaseline,
+  IssueException,
+  IssueExceptionEntry,
   PersistedState,
 } from '../../shared/model';
 import { analyze } from './analyzer';
@@ -41,6 +43,13 @@ import {
   signArticle,
   type SignoffView,
 } from './signoff';
+import {
+  acceptIssueException,
+  buildIssueExceptionView,
+  isExceptionableIssue,
+  reconfirmIssueException,
+  sanitizeIssueExceptions,
+} from './exception';
 import {
   createAnnotation as makeAnnotation,
   relocateAnnotations,
@@ -85,6 +94,10 @@ interface Snapshot {
   readingPackStale: boolean;
   /** 条款审签记录对当前正文的实时汇总（有效 / 待重签 / 未签 / 已删除） */
   signoffView: SignoffView;
+  /** 断链 / 自引用问题的例外处置记录（独立持久化，不进入撤销历史） */
+  issueExceptions: IssueException[];
+  /** 例外处置记录对当前实时分析的逐条判定（已接受 / 待复核 / 已消失） */
+  exceptionView: IssueExceptionEntry[];
   canUndo: boolean;
   canRedo: boolean;
 }
@@ -99,6 +112,8 @@ export class AppStore {
   private issueBaselines: IssueBaseline[] = [];
   /** 条款审签记录（独立于正文撤销历史；有效 / 待重签按当前条文实时重算） */
   private signoffs: ArticleSignoff[] = [];
+  /** 断链 / 自引用问题的例外处置记录（独立于撤销历史；已接受 / 待复核 / 已消失按当前分析实时重算） */
+  private issueExceptions: IssueException[] = [];
   private analysis: Analysis;
   /** 当前规范用语命中（随 docState 实时重算，不进入撤销历史） */
   private termHits: TermHit[] = [];
@@ -123,6 +138,8 @@ export class AppStore {
     this.issueBaselines = sanitizeIssueBaselines(initial.issueBaselines);
     // 审签记录随本地存储 / JSON 加载；旧数据缺少 signoffs 时按空列表加载
     this.signoffs = sanitizeSignoffs(initial.signoffs);
+    // 例外处置记录随本地存储 / JSON 加载；旧数据缺少 issueExceptions 时按空列表加载
+    this.issueExceptions = sanitizeIssueExceptions(initial.issueExceptions);
     const annotations = sanitizeAnnotations(initial.annotations);
     const termRules = sanitizeTermRules(initial.termRules);
     const doc = initial.doc;
@@ -158,17 +175,20 @@ export class AppStore {
       ? isReadingPackStale(this.readingPack, this.docRevision, this.docState.confirmed)
       : false,
     signoffView: buildSignoffView(this.docState.doc, this.signoffs),
+    issueExceptions: this.issueExceptions,
+    exceptionView: buildIssueExceptionView(this.analysis, this.issueExceptions),
     canUndo: this.past.length > 0,
     canRedo: this.future.length > 0,
   });
 
-  /** 当前完整持久化状态（正文 + 确认 + 批注 + 快照 + 问题基线 + 审签） */
+  /** 当前完整持久化状态（正文 + 确认 + 批注 + 快照 + 问题基线 + 审签 + 例外处置） */
   private currentPersisted(): PersistedState {
     return {
       ...this.docState,
       snapshots: this.snapshots,
       issueBaselines: this.issueBaselines,
       signoffs: this.signoffs,
+      issueExceptions: this.issueExceptions,
     };
   }
 
@@ -402,6 +422,8 @@ export class AppStore {
     this.snapshots = [];
     this.issueBaselines = [];
     this.signoffs = [];
+    // 例外处置绑定旧文档的稳定问题身份，新文档下一并清空
+    this.issueExceptions = [];
     // 会话内临时产物（沙盒预演、引用阅读包）基于旧正文，新文档下一律清空
     this.sandbox = null;
     this.readingPack = null;
@@ -427,6 +449,8 @@ export class AppStore {
     const termRules = sanitizeTermRules(bundle.termRules);
     // 审签记录随 JSON 导入；旧文件缺少 signoffs 时按空列表加载，有效 / 待重签按导入正文实时重算
     this.signoffs = sanitizeSignoffs(bundle.signoffs);
+    // 例外处置记录随 JSON 导入；旧文件缺少 issueExceptions 时按空列表加载，已接受 / 待复核 / 已消失按导入正文实时重算
+    this.issueExceptions = sanitizeIssueExceptions(bundle.issueExceptions);
     renumberAll(doc.root);
     this.commit({ doc: touch(doc), confirmed, annotations, termRules });
   }
@@ -442,6 +466,7 @@ export class AppStore {
       annotations: this.docState.annotations,
       termRules: this.docState.termRules,
       signoffs: this.signoffs,
+      issueExceptions: this.issueExceptions,
       exportedAt: new Date().toISOString(),
     };
   }
@@ -451,6 +476,8 @@ export class AppStore {
     this.issueBaselines = [];
     // 内置示例为全新文档，旧审签记录不再适用
     this.signoffs = [];
+    // 例外处置绑定旧文档的稳定问题身份，内置示例下一并清空
+    this.issueExceptions = [];
     // 内置示例自带示例规则（见 sampleTermRules），同时保留用户已维护的词表
     this.commit({
       doc,
@@ -538,6 +565,71 @@ export class AppStore {
   /** 当前审签汇总（供面板与徽标使用；已删除条记录单列、不计入统计） */
   getSignoffView(): SignoffView {
     return buildSignoffView(this.docState.doc, this.signoffs);
+  }
+
+  // ---------- 断链 / 自引用问题的例外处置（独立持久化，不进入撤销历史；状态按当前分析实时重算） ----------
+
+  /**
+   * 对当前断链 / 自引用问题填写理由并标记「接受例外」。
+   * 记录绑定稳定问题身份并保存处置时的来源句原文；同一身份已有记录时覆盖（刷新证据与时间）。
+   * 处置不改正文、不进入撤销历史。
+   */
+  acceptIssueException(identity: string, reason: string): { ok: boolean; error?: string } {
+    const trimmed = reason.trim();
+    if (!trimmed) return { ok: false, error: '请填写接受例外的理由' };
+    const issue = this.analysis.issues.find(
+      (i) => i.identity === identity && isExceptionableIssue(i),
+    );
+    if (!issue) return { ok: false, error: '该问题已不存在，无法接受例外' };
+    const record = acceptIssueException(issue, this.analysis, trimmed);
+    this.issueExceptions = [
+      ...this.issueExceptions.filter((r) => r.identity !== identity),
+      record,
+    ];
+    this.scheduleSave();
+    this.emit();
+    return { ok: true };
+  }
+
+  /**
+   * 待复核项重新确认：以当前实时问题刷新来源句证据，理由沿用复核框内容并刷新处置时间。
+   * 仅当身份仍在当前问题集合（已接受 / 待复核）时允许；已消失的记录须先在「已消失」区处理。
+   */
+  reconfirmIssueException(identity: string, reason: string): { ok: boolean; error?: string } {
+    const current = this.issueExceptions.find((r) => r.identity === identity);
+    if (!current) return { ok: false, error: '例外处置记录不存在' };
+    const trimmed = reason.trim();
+    if (!trimmed) return { ok: false, error: '请填写接受例外的理由' };
+    const issue = this.analysis.issues.find(
+      (i) => i.identity === identity && isExceptionableIssue(i),
+    );
+    if (!issue) return { ok: false, error: '问题已消失，无法重新确认' };
+    const record = reconfirmIssueException(current, issue, this.analysis, trimmed);
+    this.issueExceptions = this.issueExceptions.map((r) => (r.identity === identity ? record : r));
+    this.scheduleSave();
+    this.emit();
+    return { ok: true };
+  }
+
+  /** 撤销处置：删除该例外记录，问题恢复为未处置（不改正文、不进入撤销历史） */
+  revokeIssueException(identity: string): void {
+    if (!this.issueExceptions.some((r) => r.identity === identity)) return;
+    this.issueExceptions = this.issueExceptions.filter((r) => r.identity !== identity);
+    this.scheduleSave();
+    this.emit();
+  }
+
+  /** 删除已消失问题的例外留痕（仅清理记录，不影响正文） */
+  deleteIssueException(recordId: string): void {
+    if (!this.issueExceptions.some((r) => r.id === recordId)) return;
+    this.issueExceptions = this.issueExceptions.filter((r) => r.id !== recordId);
+    this.scheduleSave();
+    this.emit();
+  }
+
+  /** 当前例外处置逐条判定（供面板筛选与标记；已接受 / 待复核 / 已消失按当前分析实时重算） */
+  getExceptionView(): IssueExceptionEntry[] {
+    return buildIssueExceptionView(this.analysis, this.issueExceptions);
   }
 
   // ---------- 修订沙盒（会话内预演：在文档克隆上复用结构改写与分析，不改动正文与撤销历史） ----------

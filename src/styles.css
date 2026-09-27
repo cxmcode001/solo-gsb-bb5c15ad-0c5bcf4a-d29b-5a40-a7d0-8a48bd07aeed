@@ -1507,3 +1507,82 @@ button.small { padding: 1px 6px; font-size: 11px; }
 .signoff-entry-btn.is-stale { border-color: var(--warn); color: var(--warn); }
 .signoff-entry-btn.is-valid:hover:not(:disabled) { border-color: var(--ok); color: var(--ok); background: rgba(52, 211, 153, 0.12); }
 .signoff-entry-btn.is-stale:hover:not(:disabled) { border-color: var(--warn); color: var(--warn); background: rgba(251, 191, 36, 0.12); }
+
+/* ---------- 断链 / 自引用问题的例外处置 ---------- */
+.exception-filters { padding-top: 0; }
+.exception-filters .ex-filter.ex-open { color: var(--text-dim); }
+.exception-filters .ex-filter.ex-accepted { color: var(--ok); }
+.exception-filters .ex-filter.ex-review { color: var(--warn); }
+.exception-filters .ex-filter.ex-gone { color: var(--danger); }
+.exception-filters .ex-filter.active { border-color: var(--accent); }
+.exception-filters .ex-filter.ex-accepted.active { border-color: var(--ok); color: var(--ok); }
+.exception-filters .ex-filter.ex-review.active { border-color: var(--warn); color: var(--warn); }
+.exception-filters .ex-filter.ex-gone.active { border-color: var(--danger); color: var(--danger); }
+
+.issue-head-right { display: inline-flex; align-items: center; gap: 8px; }
+.ex-status-tag { font-size: 11px; font-weight: 700; white-space: nowrap; }
+.ex-status-tag.is-accepted { color: var(--ok); }
+.ex-status-tag.is-review { color: var(--warn); }
+.ex-status-tag.is-gone { color: var(--danger); }
+
+.issue-row.is-exception-accepted { border-style: dashed; background: rgba(52, 211, 153, 0.06); }
+.issue-row.is-exception-review { box-shadow: inset 0 0 0 1px rgba(251, 191, 36, 0.45); }
+
+.exception-box {
+  margin-top: 6px;
+  padding: 7px 9px;
+  border-radius: 6px;
+  background: rgba(52, 211, 153, 0.07);
+  border: 1px dashed rgba(52, 211, 153, 0.45);
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.exception-box.is-review {
+  background: rgba(251, 191, 36, 0.08);
+  border-color: rgba(251, 191, 36, 0.55);
+}
+.exception-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 10px; margin-top: 2px; }
+.ex-accept-toggle { color: var(--ok); border-color: rgba(52, 211, 153, 0.5); }
+.exception-reason-input {
+  width: 100%;
+  min-height: 48px;
+  resize: vertical;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text);
+  padding: 5px 8px;
+  font-size: 12px;
+  font-family: inherit;
+  line-height: 1.5;
+}
+.exception-reason-input:focus { outline: none; border-color: var(--accent); }
+.exception-reason { font-size: 12px; color: var(--text); }
+.exception-reason-tag { color: var(--text-dim); font-weight: 600; }
+.exception-time { color: var(--text-dim); font-size: 11px; white-space: nowrap; }
+.exception-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+  font-size: 11px;
+  color: var(--text-dim);
+}
+.exception-review-hint { font-size: 11.5px; color: var(--warn); }
+.exception-evidence {
+  font-size: 11.5px;
+  color: var(--text-dim);
+  line-height: 1.6;
+}
+.exception-evidence.is-current { display: flex; gap: 2px; align-items: baseline; }
+.exception-evidence-tag { color: var(--text-dim); font-weight: 600; white-space: nowrap; }
+.ex-current-sentence {
+  display: inline;
+  width: auto;
+  padding: 0;
+  font-size: 11.5px;
+}
+.exception-node-gone { color: var(--text-dim); font-size: 11px; font-style: italic; }
+.exception-gone-row { opacity: 0.8; border-left-color: var(--danger); border-style: dashed; }
+.exception-gone-list { padding-top: 10px; }

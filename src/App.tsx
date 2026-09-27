@@ -96,6 +96,9 @@ export default function App({
   const reviewCount = store.getSnapshot().annotations.filter((a) => a.status === 'review').length;
   const termHitCount = store.getSnapshot().termHits.length;
   const signoffStaleCount = store.getSnapshot().signoffView.counts.stale;
+  const exceptionReviewCount = store.getSnapshot().exceptionView.filter(
+    (e) => e.status === 'review',
+  ).length;
 
   return (
     <StoreContext.Provider value={{ store, highlighter }}>
@@ -124,7 +127,7 @@ export default function App({
                   className={rightTab === 'issues' ? 'active' : ''}
                   onClick={() => setRightTab('issues')}
                 >
-                  问题与引用
+                  问题与引用{exceptionReviewCount > 0 ? `（${exceptionReviewCount} 待复核）` : ''}
                 </button>
                 <button
                   role="tab"

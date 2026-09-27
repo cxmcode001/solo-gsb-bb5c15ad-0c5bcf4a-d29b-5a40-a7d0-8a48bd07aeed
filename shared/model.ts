@@ -304,6 +304,41 @@ export interface ArticleSignoffHistory {
 export type SignoffStatus = 'unsigned' | 'valid' | 'stale' | 'deleted';
 
 /**
+ * 断链 / 自引用问题的例外处置记录。
+ * 记录绑定稳定问题身份（identity），并保存处置时的来源句原文作为证据；
+ * 实时重算时身份仍在且来源句一致才判为「已接受」，来源句变化转「待复核」，
+ * 身份从实时问题中消失则为「已消失」。处置记录不进入正文撤销历史。
+ */
+export interface IssueException {
+  id: string;
+  /** 稳定问题身份（与 Issue.identity 相同，跨编辑对齐的唯一键） */
+  identity: string;
+  /** 问题类型：仅断链 / 自引用可做例外处置 */
+  type: IssueType;
+  /** 审阅者填写的例外理由 */
+  reason: string;
+  /** 处置时间（毫秒时间戳）；待复核重新确认时刷新 */
+  acceptedAt: number;
+  /** 处置时的源节点稳定 ID（冗余于身份，问题消失后仍可展示 / 跳转） */
+  sourceNodeId: string;
+  /** 处置时的来源句原文（trim 后保存；与实时来源句逐字比对） */
+  sourceSentence: string;
+}
+
+/** 例外处置实时状态（按当前分析重算，不入库） */
+export type IssueExceptionStatus = 'accepted' | 'review' | 'gone';
+
+/** 一条处置记录对当前实时分析的判定结果 */
+export interface IssueExceptionEntry {
+  record: IssueException;
+  status: IssueExceptionStatus;
+  /** 身份仍在时的实时问题；身份已消失时为 null */
+  currentIssue: Issue | null;
+  /** 身份仍在时的当前来源句原文；身份已消失时为 null */
+  currentSentence: string | null;
+}
+
+/**
  * 持久化状态（同时用于本地文件与浏览器缓存） */
 export interface PersistedState {
   doc: ClauseDocument;
@@ -319,6 +354,8 @@ export interface PersistedState {
   issueBaselines?: IssueBaseline[];
   /** 条款审签记录；旧数据缺少该字段时按空列表加载 */
   signoffs?: ArticleSignoff[];
+  /** 断链 / 自引用问题的例外处置记录；旧数据缺少该字段时按空列表加载 */
+  issueExceptions?: IssueException[];
 }
 
 export interface ExportBundle {
@@ -336,5 +373,7 @@ export interface ExportBundle {
   issueBaselines?: IssueBaseline[];
   /** 条款审签记录随 JSON 一并导出，导入后按当前条文重算有效 / 待重签；旧文件缺少该字段时按空列表加载 */
   signoffs?: ArticleSignoff[];
+  /** 断链 / 自引用问题的例外处置记录随 JSON 一并导出 / 导入；旧文件缺少该字段时按空列表加载 */
+  issueExceptions?: IssueException[];
   exportedAt: string;
 }

@@ -45,7 +45,13 @@ import {
   fnv1a64,
   sanitizeSignoffs,
 } from '../src/lib/signoff';
-
+import {
+  acceptIssueException,
+  buildIssueExceptionView,
+  isExceptionableIssue,
+  reconfirmIssueException,
+  sanitizeIssueExceptions,
+} from '../src/lib/exception';
 let pass = 0;
 let fail = 0;
 function check(name: string, cond: boolean, extra = '') {
@@ -2063,6 +2069,209 @@ check('闭区间为每个目标建边', combA.edges.filter((e) => e.refKey === r
   // —— 粘贴替换 / 载入示例：审签清空 ——
   reimported.importPastedText(sgText);
   check('审签：粘贴新文档后清空', reimported.getSignoffView().counts.unsigned === 3 && reimported.getSignoffView().deleted.length === 0);
+}
+
+// ---- 断链 / 自引用问题的例外处置：稳定身份 + 来源句证据、实时三态、筛选、持久化与导入导出 ----
+{
+  const exText = `例外办法
+
+第一条【目的】
+本条引用不存在的第十二条，属于断链。
+如下：
+（一）本项规定本项的适用，自指一例。
+
+第二条
+普通条文，参见第三条。
+
+第三条
+程序条文。
+
+第四条
+参见第二条。
+
+第五条
+附则。`;
+  // 解析一次：所有变体均克隆该树，保证稳定节点 ID（重新 parse 会生成新 ID）
+  const baseDoc = parseDocument(exText).doc;
+  const mkExDoc = () => ({ ...baseDoc, root: cloneTree(baseDoc.root) });
+
+  // —— 初始分析：一个断链（第一款）+ 两个自引用（项内“本项”），无循环 / 歧义 ——
+  const aA = analyze(mkExDoc(), { confirmed: {} });
+  const brokenIssue = aA.issues.find((i) => i.type === 'broken')!;
+  const selfIssue = aA.issues.find((i) => i.type === 'self')!;
+  check('例外：初始存在断链与自引用', Boolean(brokenIssue) && aA.issues.filter((i) => i.type === 'self').length === 2);
+  check('例外：断链 / 自引用可处置，循环 / 歧义不可', isExceptionableIssue(brokenIssue) && isExceptionableIssue(selfIssue));
+  check('例外：示例无循环 / 歧义', !aA.issues.some((i) => !isExceptionableIssue(i)));
+
+  const exStore = new AppStore({ doc: mkExDoc(), confirmed: {}, annotations: [] });
+  const broken = exStore.getSnapshot().analysis.issues.find((i) => i.type === 'broken')!;
+  const selfRef = exStore.getSnapshot().analysis.issues.find((i) => i.type === 'self')!;
+  const brokenNode = exStore.getSnapshot().analysis.nodes[broken.sourceNodeId];
+  const brokenSentence = brokenNode.text.slice(broken.sentenceStart, broken.sentenceEnd).trim();
+
+  // —— 接受例外：理由必填，记录身份与来源句证据 ——
+  check('例外：空理由被拒绝', exStore.acceptIssueException(broken.identity, '   ').ok === false);
+  check('例外：不存在的身份被拒绝', exStore.acceptIssueException('broken::nope::第九条::9', 'r').ok === false);
+  check('例外：接受成功', exStore.acceptIssueException(broken.identity, '  该条后续立法另行补充  ').ok === true);
+  check('例外：接受不进入撤销历史', exStore.getSnapshot().canUndo === false);
+  {
+    const rec = exStore.getSnapshot().issueExceptions[0];
+    check('例外：记录理由被 trim', rec.reason === '该条后续立法另行补充');
+    check('例外：记录绑定稳定身份', rec.identity === broken.identity);
+    check('例外：保存处置时来源句原文', rec.sourceSentence === brokenSentence && rec.sourceSentence.includes('第十二条'));
+    check('例外：保存源节点稳定 ID', rec.sourceNodeId === broken.sourceNodeId);
+    check('例外：记录类型为断链', rec.type === 'broken');
+    const v = exStore.getExceptionView();
+    check('例外：实时重算为已接受', v.length === 1 && v[0].status === 'accepted' && v[0].currentSentence === rec.sourceSentence);
+  }
+
+  // —— 偏移变化但来源句不变：身份仍在、句子一致，仍判已接受 ——
+  exStore.updateNodeText(broken.sourceNodeId, `前言增补。${brokenNode.text}`);
+  check('例外：句前加字偏移变化仍判已接受', exStore.getExceptionView()[0].status === 'accepted');
+  exStore.undo();
+  check('例外：撤销加字后仍已接受', exStore.getExceptionView()[0].status === 'accepted');
+
+  // —— 来源句变化（引用原文不变、句中其他文字改变）：身份仍在但句子不一致，转待复核；重新确认刷新证据 ——
+  exStore.updateNodeText(broken.sourceNodeId, brokenNode.text.replace('属于断链', '属于明显断链'));
+  {
+    const v = exStore.getExceptionView();
+    check('例外：来源句变化转待复核', v[0].status === 'review' && v[0].currentSentence !== v[0].record.sourceSentence);
+    check('例外：待复核数量可汇总（侧栏徽标用）', exStore.getSnapshot().exceptionView.filter((e) => e.status === 'review').length === 1);
+    check('例外：重新确认空理由被拒绝', exStore.reconfirmIssueException(broken.identity, ' ').ok === false);
+    check('例外：身份已消失时重新确认被拒绝', exStore.reconfirmIssueException('broken::gone::第九条::9', 'r').ok === false);
+    check('例外：重新确认成功', exStore.reconfirmIssueException(broken.identity, '句中文字修订，仍按例外处理').ok === true);
+    const v2 = exStore.getExceptionView();
+    check('例外：重新确认后恢复已接受', v2[0].status === 'accepted');
+    check('例外：重新确认刷新来源句证据', v2[0].record.sourceSentence.includes('明显断链') && v2[0].currentSentence === v2[0].record.sourceSentence);
+    check('例外：重新确认更新理由与时间', v2[0].record.reason === '句中文字修订，仍按例外处理' && v2[0].record.acceptedAt > 0);
+  }
+  // 撤销编辑回到初始正文：证据是“明显断链”句子，当前为原句 → 待复核（记录不随撤销删除）
+  exStore.undo();
+  check('例外：撤销正文不撤销记录，按当前句子重判待复核', exStore.getExceptionView()[0].status === 'review');
+
+  // —— 撤销处置：记录删除，问题恢复未处置（不改正文、不进历史）——
+  exStore.revokeIssueException(broken.identity);
+  check('例外：撤销处置后无记录', exStore.getSnapshot().issueExceptions.length === 0);
+  check('例外：撤销处置不改正文、不进历史', exStore.getSnapshot().canUndo === false && exStore.getSnapshot().analysis.issues.some((i) => i.identity === broken.identity));
+
+  // —— 问题消失：改正正文使身份从实时问题中消失，记录转已消失 ——
+  check('例外：再次接受成功', exStore.acceptIssueException(broken.identity, '后续立法补充').ok === true);
+  exStore.acceptIssueException(selfRef.identity, '表述需要，接受本项自指');
+  check('例外：两条已接受', exStore.getExceptionView().filter((e) => e.status === 'accepted').length === 2);
+  exStore.updateNodeText(
+    broken.sourceNodeId,
+    brokenNode.text.replace('本条引用不存在的第十二条，属于断链。', '本条引用第三条，正常无断链。'),
+  );
+  {
+    const v = exStore.getExceptionView();
+    const gone = v.find((e) => e.record.identity === broken.identity)!;
+    check('例外：问题改正后记录转已消失', gone.status === 'gone' && gone.currentIssue === null && gone.currentSentence === null);
+    check('例外：自引用记录不受影响仍已接受', v.find((e) => e.record.identity === selfRef.identity)?.status === 'accepted');
+    check('例外：已消失不计入已接受统计', exStore.getSnapshot().exceptionView.filter((e) => e.status === 'accepted').length === 1);
+  }
+  // 撤销改正：问题按同一身份回来且来源句与证据一致 → 自动恢复已接受
+  exStore.undo();
+  check('例外：撤销改正后身份回来、句子一致恢复已接受', exStore.getExceptionView().find((e) => e.record.identity === broken.identity)?.status === 'accepted');
+
+  // —— 源节点删除：断链与自引用（同在第一条）均转已消失，留痕可删除 ——
+  const art1Id = exStore.getSnapshot().doc.root[0].id;
+  exStore.deleteNode(art1Id);
+  {
+    const v = exStore.getExceptionView();
+    check('例外：删除第一条后该条两个问题记录均转已消失', v.filter((e) => e.status === 'gone').length === 2, String(v.map((e) => e.status)));
+    const gone = v.find((e) => e.record.identity === broken.identity)!;
+    check('例外：已消失保留处置时来源句证据', gone.record.sourceSentence.includes('第十二条'));
+  }
+  // 撤销删除：问题按同一身份回来，两条记录自动恢复已接受（留痕删除不进撤销历史，故放在撤销之后验证）
+  exStore.undo();
+  check('例外：撤销删除后记录恢复已接受', exStore.getExceptionView().filter((e) => e.status === 'accepted').length === 2);
+  // 再次删除后可清理留痕
+  exStore.deleteNode(art1Id);
+  const beforeDelete = exStore.getSnapshot().issueExceptions.length;
+  exStore.deleteIssueException(exStore.getExceptionView().find((e) => e.record.identity === broken.identity)!.record.id);
+  check('例外：已消失记录可删除留痕', exStore.getSnapshot().issueExceptions.length === beforeDelete - 1);
+  exStore.undo();
+
+  // —— 纯函数：accept / reconfirm（同文档克隆，节点 ID 稳定）——
+  const pureDoc = mkExDoc();
+  const aPure = analyze(pureDoc, { confirmed: {} });
+  const pureIssue = aPure.issues.find((i) => i.type === 'broken')!;
+  const rec1 = acceptIssueException(pureIssue, aPure, '理由');
+  check('例外：acceptIssueException 生成记录', rec1.identity === pureIssue.identity && rec1.reason === '理由' && rec1.sourceSentence.includes('第十二条'));
+  const changedDoc = mkExDoc();
+  const pNode = changedDoc.root[0].children.find((n) => n.id === pureIssue.sourceNodeId)!;
+  pNode.text = pNode.text.replace('属于断链', '属于明显断链');
+  const aChanged = analyze(changedDoc, { confirmed: {} });
+  const changedIssue = aChanged.issues.find((i) => i.identity === pureIssue.identity)!;
+  check('例外：身份不依赖字符偏移（同节点、同引用原文、同序次）', Boolean(changedIssue) && changedIssue.identity === pureIssue.identity);
+  const later = rec1.acceptedAt + 10;
+  const rec2 = reconfirmIssueException(rec1, changedIssue, aChanged, '新理由', later);
+  check('例外：reconfirm 刷新证据保留 id', rec2.id === rec1.id && rec2.sourceSentence.includes('明显断链') && rec2.reason === '新理由' && rec2.acceptedAt === later);
+  // 视图纯计算：句子一致已接受 / 句子变化待复核 / 身份消失已消失
+  check('例外：视图判已接受', buildIssueExceptionView(aPure, [rec1])[0].status === 'accepted');
+  check('例外：视图判待复核', buildIssueExceptionView(aChanged, [rec1])[0].status === 'review');
+  check('例外：视图判已消失', buildIssueExceptionView(analyze(mkExDoc(), { confirmed: {} }), [
+    { ...rec1, identity: 'broken::nope::第九条::9' },
+  ])[0].status === 'gone');
+
+  // —— 规整：非法记录剔除、trim、同身份去重 ——
+  check('例外：非数组规整为空', sanitizeIssueExceptions(null).length === 0);
+  check('例外：非法记录被剔除', sanitizeIssueExceptions([
+    null,
+    { id: 'a' },
+    { id: 'b', identity: 'x', type: 'cycle', reason: 'r', sourceNodeId: 'n', sourceSentence: 's', acceptedAt: 1 },
+    { id: 'c', identity: 'x', type: 'broken', reason: '  ', sourceNodeId: 'n', sourceSentence: 's', acceptedAt: 1 },
+    { id: 'd', identity: 'x', type: 'broken', reason: 'r', sourceNodeId: '', sourceSentence: 's', acceptedAt: 1 },
+    { id: 'e', identity: 'x', type: 'broken', reason: 'r', sourceNodeId: 'n', sourceSentence: '', acceptedAt: 1 },
+  ]).length === 0);
+  check('例外：合法记录规整 trim 并补 id', (() => {
+    const out = sanitizeIssueExceptions([
+      { identity: 'x', type: 'self', reason: ' 理由 ', sourceNodeId: 'n', sourceSentence: ' 句子 ', acceptedAt: 5 },
+    ]);
+    return out.length === 1 && out[0].reason === '理由' && out[0].sourceSentence === '句子' && Boolean(out[0].id);
+  })());
+  check('例外：同一身份多条只保留一条', sanitizeIssueExceptions([
+    { identity: 'x', type: 'broken', reason: 'r1', sourceNodeId: 'n', sourceSentence: 's', acceptedAt: 1 },
+    { identity: 'x', type: 'broken', reason: 'r2', sourceNodeId: 'n', sourceSentence: 's', acceptedAt: 2 },
+  ]).length === 1);
+
+  // —— 持久化 + JSON 导入导出：随包往返，旧数据按空记录加载 ——
+  const persistStore = new AppStore({ doc: mkExDoc(), confirmed: {}, annotations: [] });
+  persistStore.acceptIssueException(
+    persistStore.getSnapshot().analysis.issues.find((i) => i.type === 'broken')!.identity,
+    '持久化理由',
+  );
+  const bundle = persistStore.exportJson();
+  check('例外：随 JSON 导出', Array.isArray(bundle.issueExceptions) && bundle.issueExceptions!.length === 1 && bundle.issueExceptions![0].reason === '持久化理由');
+  const reimported = new AppStore({ doc: mkExDoc(), confirmed: {}, annotations: [] });
+  reimported.importJson(bundle);
+  check('例外：导入后按当前分析重算已接受', reimported.getExceptionView()[0]?.status === 'accepted');
+  // 例外记录随文档导入到来源句已变化的版本（引用原文不变、句中文字改变）：转待复核
+  const changedImportDoc = mkExDoc();
+  {
+    const p = changedImportDoc.root[0].children.find((n) => n.id === bundle.issueExceptions![0].sourceNodeId)!;
+    p.text = p.text.replace('属于断链', '属于明显断链');
+  }
+  const changedImport = new AppStore({ doc: mkExDoc(), confirmed: {}, annotations: [] });
+  changedImport.importJson({ doc: changedImportDoc, confirmed: {}, issueExceptions: bundle.issueExceptions });
+  check('例外：导入到变化后文档转待复核', changedImport.getExceptionView()[0]?.status === 'review', changedImport.getExceptionView()[0]?.status);
+  // 问题已消失的文档导入：转已消失
+  const goneDoc = mkExDoc();
+  {
+    const p = goneDoc.root[0].children.find((n) => n.id === bundle.issueExceptions![0].sourceNodeId)!;
+    p.text = p.text.replace('本条引用不存在的第十二条，属于断链。', '本条引用第三条，属于断链。');
+  }
+  const goneImport = new AppStore({ doc: mkExDoc(), confirmed: {}, annotations: [] });
+  goneImport.importJson({ doc: goneDoc, confirmed: {}, issueExceptions: bundle.issueExceptions });
+  check('例外：导入到问题已消失文档转已消失', goneImport.getExceptionView()[0]?.status === 'gone');
+  // 旧文件缺少 issueExceptions：按空记录加载
+  const legacy = new AppStore({ doc: mkExDoc(), confirmed: {}, annotations: [] });
+  legacy.importJson({ ...bundle, issueExceptions: undefined });
+  check('例外：旧数据缺少 issueExceptions 按空记录加载', legacy.getSnapshot().issueExceptions.length === 0);
+
+  // —— 粘贴替换 / 载入示例：例外记录清空 ——
+  reimported.importPastedText(exText);
+  check('例外：粘贴新文档后清空', reimported.getSnapshot().issueExceptions.length === 0);
 }
 
 console.log(`\n通过 ${pass} 项，失败 ${fail} 项`);
