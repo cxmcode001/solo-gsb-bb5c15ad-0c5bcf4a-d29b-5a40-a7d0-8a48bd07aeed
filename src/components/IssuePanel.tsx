@@ -9,6 +9,11 @@ import {
   type IssueDiffEntry,
   type IssueDiffStatus,
 } from '../lib/issueBaseline';
+import type {
+  IssueExceptionEntry,
+  IssueExceptionStatus,
+} from '../lib/issueException';
+import { EXCEPTION_TYPES } from '../lib/issueException';
 
 const TYPE_META: Record<IssueType, { label: string; cls: string; icon: string }> = {
   broken: { label: '断链', cls: 'it-broken', icon: '⛓' },
@@ -18,6 +23,18 @@ const TYPE_META: Record<IssueType, { label: string; cls: string; icon: string }>
 };
 
 const ORDER: IssueType[] = ['broken', 'cycle', 'self', 'ambiguous'];
+
+/** 例外处置筛选：未处置 / 已接受 / 待复核（已消失记录列于列表下方，可用「已消失」单独筛选） */
+type DispositionFilter = 'all' | 'pending' | 'accepted' | 'review' | 'gone';
+
+const DISPOSITION_META: Record<
+  Exclude<DispositionFilter, 'all' | 'pending'>,
+  { label: string; cls: string }
+> = {
+  accepted: { label: '✓ 已接受', cls: 'ex-accepted' },
+  review: { label: '⚠ 待复核', cls: 'ex-review' },
+  gone: { label: '已消失', cls: 'ex-gone' },
+};
 
 function formatTime(ms: number): string {
   if (!ms) return '时间未知';
@@ -30,8 +47,9 @@ export function IssuePanel() {
   const { store } = useApp();
   const [, force] = useState(0);
   useEffect(() => store.subscribe(() => force((n) => n + 1)), [store]);
-  const { analysis, issueBaselines } = store.getSnapshot();
+  const { analysis, issueBaselines, exceptionView } = store.getSnapshot();
   const [filter, setFilter] = useState<IssueType | 'all'>('all');
+  const [disposition, setDisposition] = useState<DispositionFilter>('all');
   const [activeBaselineId, setActiveBaselineId] = useState<string | null>(null);
 
   // 当前选中的基线被删除后自动退出比较
@@ -51,14 +69,44 @@ export function IssuePanel() {
     return map;
   }, [analysis]);
 
-  const visible =
-    filter === 'all'
-      ? analysis.issues
-      : groups.get(filter) ?? [];
-
   const counts = ORDER.map((t) => [t, groups.get(t)?.length ?? 0] as const);
+  const exCounts = exceptionView.counts;
+
+  const typeMatches = (issue: Issue) => filter === 'all' || issue.type === filter;
+  const dispositionMatches = (issue: Issue) => {
+    const entry = exceptionView.byIdentity.get(issue.identity);
+    switch (disposition) {
+      case 'all':
+        return true;
+      case 'pending':
+        return EXCEPTION_TYPES.has(issue.type) && !entry;
+      case 'accepted':
+        return entry?.status === 'accepted';
+      case 'review':
+        return entry?.status === 'review';
+      case 'gone':
+        return false; // 现存问题不属于已消失
+    }
+  };
+
+  const visible = analysis.issues.filter((i) => typeMatches(i) && dispositionMatches(i));
+  const goneEntries = exceptionView.entries.filter(
+    (e) => e.status === 'gone' && (filter === 'all' || e.exception.type === filter),
+  );
+  const showGone = disposition === 'all' || disposition === 'gone';
 
   const activeBaseline = issueBaselines.find((b) => b.id === activeBaselineId) ?? null;
+
+  const dispoButton = (key: DispositionFilter, label: React.ReactNode, disabled = false) => (
+    <button
+      key={key}
+      className={disposition === key ? 'active' : ''}
+      disabled={disabled}
+      onClick={() => setDisposition(key)}
+    >
+      {label}
+    </button>
+  );
 
   return (
     <div className="issue-panel">
@@ -91,21 +139,49 @@ export function IssuePanel() {
             ))}
           </div>
 
+          <div className="issue-filters exception-filters">
+            {dispoButton('all', '全部处置')}
+            {dispoButton('pending', `未处置 ${exCounts.pending}`)}
+            {dispoButton(
+              'accepted',
+              DISPOSITION_META.accepted.label + ` ${exCounts.accepted}`,
+              exCounts.accepted === 0,
+            )}
+            {dispoButton(
+              'review',
+              DISPOSITION_META.review.label + ` ${exCounts.review}`,
+              exCounts.review === 0,
+            )}
+            {dispoButton('gone', `已消失 ${exCounts.gone}`, exCounts.gone === 0)}
+          </div>
+
           <div className="issue-list">
-            {visible.length === 0 && (
+            {visible.length === 0 && goneEntries.length === 0 && (
               <div className="empty-hint">
                 {analysis.issues.length === 0
                   ? '✓ 全部引用均可唯一定位，且不存在自引用或循环。'
-                  : '该类别下暂无问题。'}
+                  : '该筛选条件下暂无问题。'}
               </div>
             )}
             {visible.map((issue) => (
               <IssueRow key={issue.key} issue={issue} />
             ))}
+
+            {showGone && goneEntries.length > 0 && (
+              <div className="exception-gone-box">
+                <div className="exception-gone-title">
+                  已消失的例外处置（{goneEntries.length}）
+                  <span className="exception-gone-hint">问题已不在实时检测结果中，记录保留留痕</span>
+                </div>
+                {goneEntries.map((entry) => (
+                  <GoneExceptionRow key={entry.exception.id} entry={entry} />
+                ))}
+              </div>
+            )}
           </div>
 
           <div className="panel-footer">
-            点击问题可跳到源句；悬停正文引用可在关系视图中联动高亮。
+            点击问题可跳到源句；断链 / 自引用可填写理由标记「接受例外」，处置绑定稳定问题身份与处置时来源句，来源句变化转「待复核」、问题消失转「已消失」。
           </div>
         </>
       )}
@@ -420,12 +496,13 @@ function ResolvedIssueRow({
 
 function IssueRow({ issue }: { issue: Issue }) {
   const { store, highlighter } = useApp();
-  const { analysis } = store.getSnapshot();
+  const { analysis, exceptionView } = store.getSnapshot();
   const meta = TYPE_META[issue.type];
   const sourceNode = analysis.nodes[issue.sourceNodeId];
   const refOcc: RefOccurrence | undefined = issue.refKey
     ? analysis.occurrences.find((o) => o.key === issue.refKey)
     : undefined;
+  const exceptionEntry = exceptionView.byIdentity.get(issue.identity);
 
   const sentenceText = sourceNode
     ? sourceNode.text.slice(issue.sentenceStart, issue.sentenceEnd).trim()
@@ -443,13 +520,20 @@ function IssueRow({ issue }: { issue: Issue }) {
   };
 
   return (
-    <div className={`issue-row ${meta.cls} ${issue.confirmedTargetId ? 'is-confirmed' : ''}`}>
+    <div
+      className={`issue-row ${meta.cls} ${issue.confirmedTargetId ? 'is-confirmed' : ''} ${
+        exceptionEntry ? `has-exception ex-${exceptionEntry.status}` : ''
+      }`}
+    >
       <div className="issue-row-head">
         <span className="issue-type-tag">
           {meta.icon} {issue.confirmedTargetId ? `${meta.label}（已确认）` : meta.label}
         </span>
-        <span className="issue-source-label">
-          {labelOfNode(analysis, issue.sourceNodeId)}
+        <span className="issue-head-right">
+          {exceptionEntry && <ExceptionBadge status={exceptionEntry.status} />}
+          <span className="issue-source-label">
+            {labelOfNode(analysis, issue.sourceNodeId)}
+          </span>
         </span>
       </div>
       <button className="issue-sentence" onClick={jumpSource} title="跳到源句">
@@ -507,6 +591,207 @@ function IssueRow({ issue }: { issue: Issue }) {
           ))}
         </div>
       )}
+
+      {EXCEPTION_TYPES.has(issue.type) &&
+        (exceptionEntry ? (
+          <ExceptionBox entry={exceptionEntry} />
+        ) : (
+          <ExceptionAcceptForm issue={issue} />
+        ))}
+    </div>
+  );
+}
+
+/** 例外处置状态徽标（问题行头部） */
+function ExceptionBadge({ status }: { status: IssueExceptionStatus }) {
+  if (status === 'accepted') return <span className="exception-badge ex-accepted">✓ 已接受例外</span>;
+  if (status === 'review') return <span className="exception-badge ex-review">⚠ 待复核</span>;
+  return <span className="exception-badge ex-gone">已消失</span>;
+}
+
+/** 问题行内的例外处置区：未处置时填写理由；已接受展示理由与撤销；待复核提示来源句变化并要求重新确认 */
+function ExceptionBox({ entry }: { entry: IssueExceptionEntry }) {
+  const { store } = useApp();
+  const [error, setError] = useState<string | null>(null);
+  const { exception, status } = entry;
+
+  if (status === 'accepted') {
+    return (
+      <div className="exception-box ex-accepted-box">
+        <div className="exception-head">
+          <span className="exception-tag ex-accepted">✓ 已接受例外</span>
+          <span className="exception-time">{formatTime(exception.acceptedAt)}</span>
+        </div>
+        <div className="exception-reason" title="处置理由">
+          {exception.reason}
+        </div>
+        <div className="ann-row-actions">
+          <button
+            className="link-btn subtle"
+            onClick={() => store.revokeIssueException(exception.identity)}
+          >
+            撤销处置
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  if (status === 'review') {
+    const reconfirm = () => {
+      const res = store.reconfirmIssueException(exception.identity);
+      setError(res.ok ? null : res.error ?? '重新确认失败');
+    };
+    return (
+      <div className="exception-box ex-review-box">
+        <div className="exception-head">
+          <span className="exception-tag ex-review">⚠ 待复核</span>
+          <span className="exception-time">处置于 {formatTime(exception.acceptedAt)}</span>
+        </div>
+        <div className="exception-reason" title="处置理由">
+          {exception.reason}
+        </div>
+        <div className="exception-sentence-diff">
+          <div className="exception-sentence-old">
+            <span className="combined-tag">处置时来源句：</span>
+            {exception.sentence}
+          </div>
+          <div className="exception-sentence-new">
+            <span className="combined-tag">当前来源句：</span>
+            {entry.currentSentence ?? '（无法定位）'}
+          </div>
+        </div>
+        {error && <div className="form-error">{error}</div>}
+        <div className="ann-row-actions">
+          <button className="link-btn" onClick={reconfirm} title="以当前来源句重新固化处置证据">
+            ✓ 来源句一致，重新确认
+          </button>
+          <button
+            className="link-btn subtle"
+            onClick={() => store.revokeIssueException(exception.identity)}
+          >
+            撤销处置
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // gone：问题行本身不会出现已消失项（已消失记录单列于下方），此处兜底不渲染
+  return null;
+}
+
+/** 未处置问题行内的「接受例外」理由表单 */
+function ExceptionAcceptForm({ issue }: { issue: Issue }) {
+  const { store } = useApp();
+  const [reason, setReason] = useState('');
+  const [open, setOpen] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  if (!open) {
+    return (
+      <div className="ann-row-actions">
+        <button className="link-btn" onClick={() => setOpen(true)}>
+          🛡 接受例外（填写理由）
+        </button>
+      </div>
+    );
+  }
+
+  const submit = () => {
+    const res = store.acceptIssueException(issue.identity, reason);
+    if (!res.ok) {
+      setError(res.error ?? '处置失败');
+      return;
+    }
+    setError(null);
+    setReason('');
+    setOpen(false);
+  };
+
+  return (
+    <div className="exception-box ex-form-box">
+      <textarea
+        className="exception-reason-input"
+        placeholder="填写接受该断链 / 自引用为例外的理由，如「该条由配套法规另行规定，暂不补条」"
+        value={reason}
+        onChange={(e) => {
+          setReason(e.target.value);
+          setError(null);
+        }}
+        rows={2}
+      />
+      {error && <div className="form-error">{error}</div>}
+      <div className="ann-edit-actions">
+        <button className="link-btn subtle" onClick={() => { setOpen(false); setError(null); }}>
+          取消
+        </button>
+        <button className="primary small" onClick={submit}>
+          标记接受例外
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/** 已消失处置记录：问题不在实时结果中，按源节点 / 引用原文尝试重定位现存源句，可撤销 */
+function GoneExceptionRow({ entry }: { entry: IssueExceptionEntry }) {
+  const { store, highlighter } = useApp();
+  const { analysis } = store.getSnapshot();
+  const { exception, jump } = entry;
+  const meta = TYPE_META[exception.type];
+  const canJump = Boolean(jump);
+
+  const doJump = () => {
+    if (!jump) return;
+    highlighter.jumpTo(jump.nodeId, { start: jump.start, end: jump.end }, jump.refKey);
+  };
+
+  return (
+    <div className="issue-row ex-gone-row">
+      <div className="issue-row-head">
+        <span className="issue-type-tag">
+          {meta.icon} {meta.label}
+        </span>
+        <span className="issue-head-right">
+          <span className="exception-badge ex-gone">已消失</span>
+          <span className="issue-source-label">
+            {labelOfNode(analysis, exception.sourceNodeId)}
+          </span>
+        </span>
+      </div>
+      {canJump ? (
+        <button className="issue-sentence" onClick={doJump} title="按源节点与引用原文重定位现存源句">
+          “{entry.currentSentence && entry.currentSentence.length > 60
+            ? entry.currentSentence.slice(0, 60) + '…'
+            : entry.currentSentence ?? exception.sentence}”
+        </button>
+      ) : (
+        <div className="issue-sentence is-static" title="源节点已删除，无法定位">
+          “{exception.sentence.length > 60 ? exception.sentence.slice(0, 60) + '…' : exception.sentence}”
+        </div>
+      )}
+      <div className="exception-reason">
+        <span className="combined-tag">理由：</span>
+        {exception.reason}
+      </div>
+      <div className="exception-meta-line">
+        <span className="exception-time">处置于 {formatTime(exception.acceptedAt)}</span>
+        {!canJump && <span className="bl-gone">源节点已删除，不可跳转</span>}
+      </div>
+      <div className="ann-row-actions">
+        {canJump && (
+          <button className="link-btn" onClick={doJump}>
+            → 跳转来源正文
+          </button>
+        )}
+        <button
+          className="link-btn subtle"
+          onClick={() => store.revokeIssueException(exception.identity)}
+        >
+          撤销处置
+        </button>
+      </div>
     </div>
   );
 }

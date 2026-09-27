@@ -45,6 +45,14 @@ import {
   fnv1a64,
   sanitizeSignoffs,
 } from '../src/lib/signoff';
+import {
+  buildIssueExceptionView,
+  createIssueException,
+  reconfirmIssueException,
+  relocateExceptionJump,
+  sanitizeIssueExceptions,
+  EXCEPTION_TYPES,
+} from '../src/lib/issueException';
 
 let pass = 0;
 let fail = 0;
@@ -2063,6 +2071,251 @@ check('闭区间为每个目标建边', combA.edges.filter((e) => e.refKey === r
   // —— 粘贴替换 / 载入示例：审签清空 ——
   reimported.importPastedText(sgText);
   check('审签：粘贴新文档后清空', reimported.getSignoffView().counts.unsigned === 3 && reimported.getSignoffView().deleted.length === 0);
+}
+
+// ---- 问题例外处置：接受 / 撤销、身份绑定与来源句证据、待复核 / 已消失实时重算、持久化与导入导出 ----
+{
+  const exText = `例外办法
+
+第一条【目的】
+为了规范例外处置活动，制定本办法。
+
+第二条【程序】
+程序如下：
+（一）本项另有规定的，从其规定；
+（二）其余事项。
+
+第三条【衔接】
+适用第九条的规定。`;
+  const mkExDoc = () => parseDocument(exText).doc;
+  /** 把 b 的全部节点 id 同步为 a（模拟同一文档的连续编辑） */
+  const syncIds = (a: import('../shared/model').ClauseDocument, b: import('../shared/model').ClauseDocument) => {
+    const walkA = a.root.flatMap((x) => [x, ...x.children.flatMap((pa) => [pa, ...pa.children])]);
+    const walkB = b.root.flatMap((x) => [x, ...x.children.flatMap((pa) => [pa, ...pa.children])]);
+    walkB.forEach((n, i) => { if (walkA[i]) n.id = walkA[i].id; });
+  };
+
+  // 纯函数：创建处置记录绑定身份与处置时来源句
+  const d0 = mkExDoc();
+  renumberAll(d0.root);
+  const a0 = analyze(d0, { confirmed: {} });
+  const brokenIssue = a0.issues.find((i) => i.type === 'broken')!;
+  const selfIssue = a0.issues.find((i) => i.type === 'self')!;
+  check('例外：样例含断链与自引用', Boolean(brokenIssue) && Boolean(selfIssue), JSON.stringify(a0.issues.map((i) => i.type)));
+  check('例外：自引用源自项节点', selfIssue.sourceNodeId === d0.root[1].children[0].children[0].id);
+  check('例外：仅断链 / 自引用可处置', EXCEPTION_TYPES.has('broken') && EXCEPTION_TYPES.has('self') && !EXCEPTION_TYPES.has('cycle') && !EXCEPTION_TYPES.has('ambiguous'));
+
+  const exc = createIssueException(brokenIssue, a0, '配套法规另行规定');
+  check('例外：记录绑定稳定身份', exc.identity === brokenIssue.identity && exc.sourceNodeId === brokenIssue.sourceNodeId);
+  check('例外：保存处置时来源句原文', exc.sentence === '适用第九条的规定。', exc.sentence);
+  check('例外：记录理由与时间', exc.reason === '配套法规另行规定' && exc.acceptedAt > 0);
+
+  // 初始视图：1 已接受，断链未处置数减少
+  let view = buildIssueExceptionView([exc], a0);
+  check('例外：来源句一致显示已接受', view.byIdentity.get(brokenIssue.identity)?.status === 'accepted');
+  check('例外：未处置计数不含已处置问题', view.counts.pending === 1 && view.counts.accepted === 1, JSON.stringify(view.counts));
+  check('例外：自引用仍计未处置', view.counts.pending === 1);
+  check('例外：已接受条目可跳转当前源句', (() => {
+    const e = view.byIdentity.get(brokenIssue.identity)!;
+    return e.jump?.nodeId === brokenIssue.sourceNodeId && d0.root[2].children[0].text.includes('第九条');
+  })());
+
+  // 引用前插入文字（同一句内）：身份仍在但来源句变化 → 待复核
+  const dShiftDoc = parseDocument(`例外办法
+
+第一条【目的】
+为了规范例外处置活动，制定本办法。
+
+第二条【程序】
+程序如下：
+（一）本项另有规定的，从其规定；
+（二）其余事项。
+
+第三条【衔接】
+另作衔接安排后，适用第九条的规定。`).doc;
+  renumberAll(dShiftDoc.root);
+  syncIds(d0, dShiftDoc);
+  const aShift = analyze(dShiftDoc, { confirmed: {} });
+  view = buildIssueExceptionView([exc], aShift);
+  check('例外：来源句变化标待复核', view.byIdentity.get(exc.identity)?.status === 'review', view.byIdentity.get(exc.identity)?.status);
+  check('例外：待复核条目保留当前来源句与跳转', (() => {
+    const e = view.byIdentity.get(exc.identity)!;
+    return e.currentSentence === '另作衔接安排后，适用第九条的规定。' && e.jump?.nodeId === dShiftDoc.root[2].children[0].id;
+  })());
+  check('例外：待复核计数', view.counts.review === 1 && view.counts.accepted === 0);
+
+  // 引用所在句之前另起一句：来源句严格一致 → 仍已接受
+  const dSentenceDoc = parseDocument(`例外办法
+
+第一条【目的】
+为了规范例外处置活动，制定本办法。
+
+第二条【程序】
+程序如下：
+（一）本项另有规定的，从其规定；
+（二）其余事项。
+
+第三条【衔接】
+先写一句无关的话。适用第九条的规定。`).doc;
+  renumberAll(dSentenceDoc.root);
+  syncIds(d0, dSentenceDoc);
+  const aSentence = analyze(dSentenceDoc, { confirmed: {} });
+  view = buildIssueExceptionView([exc], aSentence);
+  check('例外：他句文字变化不影响处置句 → 已接受', view.byIdentity.get(exc.identity)?.status === 'accepted', view.byIdentity.get(exc.identity)?.status);
+
+  // 待复核重新确认：刷新来源句证据 → 回到已接受
+  const liveIssue = aShift.issues.find((i) => i.identity === exc.identity)!;
+  const reconfirmed = reconfirmIssueException(exc, liveIssue, aShift);
+  check('例外：重新确认刷新来源句证据', reconfirmed.sentence === '另作衔接安排后，适用第九条的规定。');
+  check('例外：重新确认刷新处置时间', reconfirmed.acceptedAt >= exc.acceptedAt);
+  view = buildIssueExceptionView([reconfirmed], aShift);
+  check('例外：重新确认后显示已接受', view.byIdentity.get(exc.identity)?.status === 'accepted');
+
+  // 问题被修复（补齐第九条）：身份消失 → 已消失
+  const dFixedDoc = parseDocument(`例外办法
+
+第一条【目的】
+为了规范例外处置活动，制定本办法。
+
+第二条【程序】
+程序如下：
+（一）本项另有规定的，从其规定；
+（二）其余事项。
+
+第三条【衔接】
+适用第九条的规定。
+
+第四条
+过渡。
+
+第五条
+过渡。
+
+第六条
+过渡。
+
+第七条
+过渡。
+
+第八条
+过渡。
+
+第九条【被援引条】
+目标条内容。`).doc;
+  renumberAll(dFixedDoc.root);
+  syncIds(d0, dFixedDoc);
+  const aFixed = analyze(dFixedDoc, { confirmed: {} });
+  check('例外：补齐目标后断链问题消失', !aFixed.issues.some((i) => i.identity === exc.identity));
+  view = buildIssueExceptionView([exc], aFixed);
+  check('例外：问题消失标已消失', view.entries[0].status === 'gone' && view.counts.gone === 1);
+  // 引用原文仍可按源节点 + 原文 + 同文序次重定位（问题已不是 broken，但引用还在）
+  const goneJump = relocateExceptionJump(exc, aFixed);
+  check('例外：已消失项按现存引用重定位源句', goneJump?.nodeId === dFixedDoc.root[2].children[0].id && dFixedDoc.root[2].children[0].text.slice(goneJump.start, goneJump.end).includes('第九条'), JSON.stringify(goneJump));
+
+  // 源节点删除 → 已消失且不可跳转
+  const dGoneDoc = parseDocument(`例外办法
+
+第一条【目的】
+为了规范例外处置活动，制定本办法。
+
+第二条【程序】
+程序如下：
+（一）本项另有规定的，从其规定；
+（二）其余事项。`).doc;
+  renumberAll(dGoneDoc.root);
+  syncIds(d0, dGoneDoc);
+  const aGone = analyze(dGoneDoc, { confirmed: {} });
+  view = buildIssueExceptionView([exc], aGone);
+  check('例外：源节点删除标已消失且不可跳转', view.entries[0].status === 'gone' && view.entries[0].jump === null);
+
+  // 问题消失后重新出现且来源句仍为处置时原文 → 自动回到已接受（撤销恢复原文同理）
+  view = buildIssueExceptionView([exc], a0);
+  check('例外：问题以相同来源句重现 → 自动已接受', view.byIdentity.get(exc.identity)?.status === 'accepted');
+
+  // —— Store：接受 / 校验 / 撤销，不改正文、不进入撤销历史 ——
+  const store = new AppStore({ doc: mkExDoc(), confirmed: {}, annotations: [] });
+  const sBroken = store.getSnapshot().analysis.issues.find((i) => i.type === 'broken')!;
+  check('例外：空理由被拒绝', store.acceptIssueException(sBroken.identity, '  ').ok === false);
+  check('例外：不存在的身份被拒绝', store.acceptIssueException('broken::nope::xx::1', '理由').ok === false);
+  check('例外：接受成功', store.acceptIssueException(sBroken.identity, '暂不补条').ok === true);
+  check('例外：重复处置被拒绝', store.acceptIssueException(sBroken.identity, '再来一次').ok === false);
+  check('例外：接受后不进入撤销历史', store.getSnapshot().canUndo === false);
+  {
+    const v = store.getSnapshot().exceptionView;
+    check('例外：Store 实时汇总为已接受', v.byIdentity.get(sBroken.identity)?.status === 'accepted');
+    check('例外：Store 未处置计数仅余自引用', v.counts.pending === 1 && v.counts.accepted === 1, JSON.stringify(v.counts));
+  }
+
+  // 正文编辑使来源句变化 → 待复核；重新确认须刷新证据；撤销恢复原文自动回已接受
+  const par = store.getSnapshot().doc.root[2].children[0];
+  store.updateNodeText(par.id, '另作安排后，适用第九条的规定。');
+  check('例外：正文编辑后转待复核', store.getSnapshot().exceptionView.byIdentity.get(sBroken.identity)?.status === 'review');
+  check('例外：问题消失后重新确认才可用——此处身份仍在，重新确认成功', store.reconfirmIssueException(sBroken.identity).ok === true);
+  check('例外：重新确认后回已接受', store.getSnapshot().exceptionView.byIdentity.get(sBroken.identity)?.status === 'accepted');
+  // 撤销文本编辑：处置证据是新句，回到旧句时不一致 → 待复核；再确认旧句，重做又待复核，撤销回已接受
+  store.undo();
+  check('例外：撤销编辑后来源句与新证据不一致 → 待复核', store.getSnapshot().exceptionView.byIdentity.get(sBroken.identity)?.status === 'review');
+  check('例外：待复核时可重新确认旧句', store.reconfirmIssueException(sBroken.identity).ok === true);
+  store.redo();
+  check('例外：重做编辑后又待复核', store.getSnapshot().exceptionView.byIdentity.get(sBroken.identity)?.status === 'review');
+  store.undo();
+  check('例外：撤销恢复处置时原文 → 已接受', store.getSnapshot().exceptionView.byIdentity.get(sBroken.identity)?.status === 'accepted');
+
+  // 撤销处置：问题回到未处置
+  store.revokeIssueException(sBroken.identity);
+  check('例外：撤销后无记录', store.getSnapshot().exceptionView.byIdentity.get(sBroken.identity) === undefined);
+  check('例外：撤销后未处置恢复 2', store.getSnapshot().exceptionView.counts.pending === 2, JSON.stringify(store.getSnapshot().exceptionView.counts));
+  check('例外：重复撤销无副作用', (store.revokeIssueException(sBroken.identity), store.getSnapshot().exceptionView.counts.total === 0));
+
+  // 问题消失后重新确认被拒绝
+  store.acceptIssueException(sBroken.identity, '暂不补条');
+  const storeFix = new AppStore({ doc: JSON.parse(JSON.stringify(store.getSnapshot().doc)), confirmed: {}, annotations: [], issueExceptions: store.exportJson().issueExceptions });
+  const fixPar = storeFix.getSnapshot().doc.root[2].children[0];
+  storeFix.updateNodeText(fixPar.id, '衔接完毕。');
+  check('例外：问题消失后重新确认被拒绝', storeFix.reconfirmIssueException(sBroken.identity).ok === false);
+  check('例外：问题消失后计数为已消失', storeFix.getSnapshot().exceptionView.counts.gone === 1);
+
+  // —— 持久化 + JSON 导入导出：随包往返，旧数据按空记录加载 ——
+  const store3 = new AppStore({ doc: mkExDoc(), confirmed: {}, annotations: [] });
+  const sSelf = store3.getSnapshot().analysis.issues.find((i) => i.type === 'self')!;
+  check('例外：自引用接受成功', store3.acceptIssueException(sSelf.identity, '本项表述有意为之').ok === true);
+  const bundle = store3.exportJson();
+  check('例外：随 JSON 导出', Array.isArray(bundle.issueExceptions) && bundle.issueExceptions!.length === 1);
+  const store4 = new AppStore({ doc: mkExDoc(), confirmed: {}, annotations: [] });
+  check('例外：旧数据缺 issueExceptions 按空记录加载', store4.getSnapshot().exceptionView.counts.total === 0 && store4.getSnapshot().exceptionView.counts.pending === 2);
+  store4.importJson(bundle);
+  check('例外：导入恢复处置并实时重算已接受', store4.getSnapshot().exceptionView.counts.accepted === 1, JSON.stringify(store4.getSnapshot().exceptionView.counts));
+
+  // 导入到来源句已变化的正文 → 待复核（在同一文档实例上改正文后导出，稳定节点 ID 保持；
+  // 另起一句保证问题身份与同文序次不变，仅处置时来源句文字变化）
+  const changedStore = new AppStore({ doc: JSON.parse(JSON.stringify(store3.getSnapshot().doc)), confirmed: {}, annotations: [] });
+  const selfParItem = changedStore.getSnapshot().doc.root[1].children[0].children[0];
+  changedStore.updateNodeText(selfParItem.id, '本项另有规定的，从其规定；另有变化。');
+  const store5 = new AppStore({ doc: JSON.parse(JSON.stringify(store3.getSnapshot().doc)), confirmed: {}, annotations: [] });
+  store5.importJson({ ...bundle, document: changedStore.exportJson().document });
+  check('例外：导入后按当前正文重算待复核', store5.getSnapshot().exceptionView.counts.review === 1, JSON.stringify(store5.getSnapshot().exceptionView.counts));
+
+  // 粘贴替换 / 载入示例：处置记录清空
+  store4.importPastedText(exText);
+  check('例外：粘贴新文档后清空', store4.getSnapshot().exceptionView.counts.total === 0);
+
+  // —— 规整：非法记录剔除、仅断链 / 自引用、同身份去重保留最新 ——
+  check('例外：非数组规整为空', sanitizeIssueExceptions(null).length === 0);
+  check('例外：非法记录被过滤', sanitizeIssueExceptions([
+    null,
+    42,
+    { identity: '', type: 'broken', sourceNodeId: 'n', reason: 'r', sentence: 's', acceptedAt: 1 },
+    { identity: 'i', type: 'cycle', sourceNodeId: 'n', reason: 'r', sentence: 's', acceptedAt: 1 },
+    { identity: 'i', type: 'broken', sourceNodeId: 'n', reason: '  ', sentence: 's', acceptedAt: 1 },
+    { identity: 'i', type: 'broken', sourceNodeId: 'n', reason: 'r', sentence: '', acceptedAt: 1 },
+  ]).length === 0);
+  const cleaned = sanitizeIssueExceptions([
+    { id: 'e1', identity: 'i1', type: 'broken', sourceNodeId: 'n1', reason: ' 理由 ', sentence: ' 源句 ', acceptedAt: 5 },
+    { identity: 'i1', type: 'broken', sourceNodeId: 'n1', reason: '新理由', sentence: '源句', acceptedAt: 9 },
+    { identity: 'i2', type: 'self', sourceNodeId: 'n2', reason: '自指', sentence: '源句2', acceptedAt: 3 },
+  ]);
+  check('例外：同身份去重保留最新并 trim', cleaned.length === 2 && cleaned.find((e) => e.identity === 'i1')!.reason === '新理由' && cleaned.find((e) => e.identity === 'i1')!.acceptedAt === 9);
+  check('例外：缺 id 自动补全', sanitizeIssueExceptions([{ identity: 'i', type: 'self', sourceNodeId: 'n', reason: 'r', sentence: 's', acceptedAt: 1 }])[0].id.startsWith('exc_'));
 }
 
 console.log(`\n通过 ${pass} 项，失败 ${fail} 项`);
